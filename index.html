@@ -1,0 +1,215 @@
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#102b46">
+<title>PrivateChat</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0c1724;color:#fff;font-family:Arial,sans-serif}
+header{background:#102b46;padding:18px;font-size:23px;font-weight:bold}
+small{display:block;color:#b7d7ee;font-size:13px;margin-top:6px}
+main{max-width:850px;margin:auto;padding:16px}
+.panel{background:#14283b;padding:18px;border-radius:15px;margin:12px 0}
+input,button{padding:13px;border:0;border-radius:10px;font-size:15px}
+input{width:100%;margin:6px 0;background:#f3f6fa;color:#111}
+button{cursor:pointer;background:#32c69a;font-weight:bold;margin:4px}
+button.secondary{background:#29445c;color:white}
+#layout{display:grid;grid-template-columns:220px 1fr;gap:12px}
+#users button{width:100%;overflow-wrap:anywhere}
+#messages{height:48vh;min-height:220px;overflow:auto;padding:8px}
+.msg{padding:10px 13px;margin:8px 0;border-radius:13px;max-width:90%;overflow-wrap:anywhere;white-space:pre-wrap}
+.mine{background:#17654e;margin-right:auto}
+.theirs{background:#29445c;margin-left:auto}
+#send{display:flex;gap:6px}
+#send input{flex:1;min-width:0}
+.note{color:#a9bdcf;font-size:13px}
+#error{color:#ff9d9d;white-space:pre-wrap}
+@media(max-width:580px){#layout{grid-template-columns:1fr}#users{display:flex;overflow:auto}#users button{min-width:150px}#messages{height:40vh}}
+</style>
+</head>
+<body>
+<header>PrivateChat<small>دردش مع الناس من أي مكان</small></header>
+<main>
+<div id="auth" class="panel">
+<h3 id="authTitle">إنشاء حساب جديد</h3>
+<form id="authForm">
+<input id="email" type="email" placeholder="البريد الإلكتروني" autocomplete="email" required>
+<input id="password" type="password" placeholder="كلمة المرور (10 أحرف على الأقل)" minlength="10" maxlength="128" required>
+<button id="submitAuth">إنشاء حساب</button>
+<button id="switchAuth" type="button" class="secondary">عندي حساب بالفعل</button>
+</form>
+<p id="error"></p>
+</div>
+
+<section id="chatApp" hidden>
+<div class="panel">
+أنت مسجل الدخول باسم: <b id="myEmail"></b>
+<button id="logout" class="secondary">تسجيل الخروج</button>
+</div>
+<div id="layout">
+<aside class="panel">
+<h3>المستخدمون</h3>
+<button id="refresh" class="secondary">تحديث القائمة</button>
+<div id="users"></div>
+</aside>
+<section class="panel">
+<h3 id="chatTitle">اختار مستخدمًا لبدء المحادثة</h3>
+<div id="messages"></div>
+<form id="send">
+<input id="text" maxlength="2000" placeholder="اكتب رسالتك..." autocomplete="off" required>
+<button>إرسال</button>
+</form>
+<p class="note">الرسائل محفوظة على السيرفر، وليست مشفرة تشفيرًا من الطرف إلى الطرف.</p>
+</section>
+</div>
+</section>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('pc_token') || '';
+let me = null, selected = null, socket = null, registerMode = true;
+const esc = value => String(value);
+function error(message=''){ $('error').textContent = message; }
+
+async function api(url, options={}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type':'application/json',
+      ...(token ? {Authorization:'Bearer '+token} : {}),
+      ...(options.headers || {})
+    }
+  });
+  const data = await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data.error || 'حدث خطأ في الاتصال');
+  return data;
+}
+
+function showAuth(){
+  $('auth').hidden = false;
+  $('chatApp').hidden = true;
+  if(socket){socket.disconnect();socket=null;}
+}
+
+function showChat(){
+  $('auth').hidden = true;
+  $('chatApp').hidden = false;
+  $('myEmail').textContent = me.email;
+}
+
+function updateAuthMode(){
+  $('authTitle').textContent = registerMode ? 'إنشاء حساب جديد' : 'تسجيل الدخول';
+  $('submitAuth').textContent = registerMode ? 'إنشاء حساب' : 'دخول';
+  $('switchAuth').textContent = registerMode ? 'عندي حساب بالفعل' : 'إنشاء حساب جديد';
+}
+
+$('switchAuth').onclick = () => {
+  registerMode = !registerMode;
+  error('');
+  updateAuthMode();
+};
+
+$('authForm').onsubmit = async event => {
+  event.preventDefault();
+  error('');
+  try{
+    const data = await api(registerMode ? '/register' : '/login', {
+      method:'POST',
+      body:JSON.stringify({email:$('email').value,password:$('password').value})
+    });
+    token = data.token;
+    me = data.user;
+    localStorage.setItem('pc_token',token);
+    await startChat();
+  }catch(e){error(e.message);}
+};
+
+async function startChat(){
+  try{
+    me = await api('/me');
+    showChat();
+    socket = io({auth:{token}});
+    socket.on('connect_error', () => error('تعذر الاتصال بالشات. سجّل الدخول مجددًا.'));
+    socket.on('private-message', message => {
+      if(selected && (message.from===selected.id || message.to===selected.id))
+        addMessage(message);
+    });
+    socket.on('message-sent', message => {
+      if(selected && message.to===selected.id) addMessage(message);
+    });
+    await loadUsers();
+  }catch(e){
+    localStorage.removeItem('pc_token');
+    token='';
+    me=null;
+    showAuth();
+    error(e.message);
+  }
+}
+
+async function loadUsers(){
+  try{
+    const list = await api('/users');
+    $('users').replaceChildren();
+    list.forEach(user=>{
+      const button=document.createElement('button');
+      button.className='secondary';
+      button.textContent=user.email;
+      button.onclick=()=>openChat(user);
+      $('users').appendChild(button);
+    });
+    if(!list.length) $('users').textContent='لا يوجد مستخدمون آخرون بعد.';
+  }catch(e){error(e.message);}
+}
+
+async function openChat(user){
+  selected=user;
+  $('chatTitle').textContent=user.email;
+  $('messages').replaceChildren();
+  if(socket) socket.emit('join-private',user.id);
+  try{
+    const list=await api('/messages/'+encodeURIComponent(user.id));
+    $('messages').replaceChildren();
+    list.forEach(addMessage);
+    $('messages').scrollTop=$('messages').scrollHeight;
+  }catch(e){error(e.message);}
+}
+
+function addMessage(message){
+  const node=document.createElement('div');
+  node.className='msg '+(message.from===me.id?'mine':'theirs');
+  node.textContent=message.text;
+  node.title=new Date(message.time).toLocaleString();
+  $('messages').appendChild(node);
+  $('messages').scrollTop=$('messages').scrollHeight;
+}
+
+$('send').onsubmit = event => {
+  event.preventDefault();
+  const text=$('text').value.trim();
+  if(!text || !selected || !socket || !socket.connected) {
+    error('اختار مستخدمًا وتأكد من اتصال الشات.');
+    return;
+  }
+  socket.emit('private-message',{to:selected.id,text});
+  $('text').value='';
+  error('');
+};
+
+$('refresh').onclick=loadUsers;
+$('logout').onclick=()=>{
+  localStorage.removeItem('pc_token');
+  token='';me=null;selected=null;
+  showAuth();
+};
+updateAuthMode();
+if(token) startChat(); else showAuth();
+</script>
+</body>
+</html>
+
